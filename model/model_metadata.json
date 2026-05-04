@@ -1,0 +1,28 @@
+{
+  "features": [
+    "Time(min)",
+    "Temperature(°C)",
+    "pH",
+    "C0(mg/L)",
+    "Dosage(g/L)"
+  ],
+  "target": "qe(mg/g)",
+  "best_params": {
+    "n_estimators": 300,
+    "learning_rate": 0.05,
+    "max_depth": 3,
+    "subsample": 0.85,
+    "random_state": 42
+  },
+  "metrics": {
+    "R2_train": 0.9984170445523003,
+    "R2_cv": 0.9325653692614895,
+    "R2_test": 0.9831123868028686,
+    "RMSE_train": 1.0783066215069184,
+    "RMSE_test": 4.422397973625516,
+    "MAE_train": 0.5491548786416927,
+    "MAE_test": 3.1355752206392875
+  },
+  "n_samples": 64,
+  "training_note": "Final deployable GBR model trained on the full dataset using benchmark-selected hyperparameters."
+}
