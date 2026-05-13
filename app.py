@@ -20,8 +20,10 @@ MODEL_PATH = BASE_DIR / "model" / "gbr_best_model.joblib"
 METADATA_PATH = BASE_DIR / "model" / "model_metadata.json"
 
 RANDOM_SEED = 42
+
 FEATURES = ["Time(min)", "Temperature(°C)", "pH", "C0(mg/L)", "Dosage(g/L)"]
 TARGET = "qe(mg/g)"
+
 BEST_PARAMS = {
     "n_estimators": 300,
     "learning_rate": 0.05,
@@ -30,19 +32,48 @@ BEST_PARAMS = {
     "random_state": RANDOM_SEED,
 }
 
+# 这里专门兼容 CSV 里可能出现的乱码/不同写法
 COLUMN_ALIASES = {
+    # Time
+    "Time(min)": "Time(min)",
     "Time (min)": "Time(min)",
     "Time": "Time(min)",
     "time": "Time(min)",
+
+    # Temperature
+    "Temperature(°C)": "Temperature(°C)",
     "Temperature (°C)": "Temperature(°C)",
+    "Temperature(℃)": "Temperature(°C)",
+    "Temperature(??C)": "Temperature(°C)",
+    "Temperature(?C)": "Temperature(°C)",
+    "Temperature(C)": "Temperature(°C)",
+    "Temperature (C)": "Temperature(°C)",
     "Temperature": "Temperature(°C)",
     "Temp": "Temperature(°C)",
     "temp": "Temperature(°C)",
+
+    # pH
+    "pH": "pH",
+    "PH": "pH",
+    "ph": "pH",
+
+    # C0
+    "C0(mg/L)": "C0(mg/L)",
     "C0 (mg/L)": "C0(mg/L)",
+    "C₀(mg/L)": "C0(mg/L)",
+    "C₀ (mg/L)": "C0(mg/L)",
     "C0": "C0(mg/L)",
+
+    # Dosage
+    "Dosage(g/L)": "Dosage(g/L)",
     "Dosage (g/L)": "Dosage(g/L)",
     "Dosage": "Dosage(g/L)",
+
+    # Target
+    "qe(mg/g)": "qe(mg/g)",
     "qe (mg/g)": "qe(mg/g)",
+    "q_e(mg/g)": "qe(mg/g)",
+    "qₑ(mg/g)": "qe(mg/g)",
 }
 
 # -------------------------
@@ -55,7 +86,7 @@ st.set_page_config(
 )
 
 # -------------------------
-# 2) Soft red style, adapted from App (1).py
+# 2) Soft red style
 # -------------------------
 st.markdown(
     """
@@ -211,20 +242,78 @@ hr{ border:none; border-top:1px solid rgba(190,18,60,0.13); margin:18px 0; }
 # -------------------------
 # 3) Data/model helpers
 # -------------------------
+def clean_column_name(col: object) -> str:
+    """Clean one column name from CSV."""
+    clean = str(col)
+    clean = clean.replace("\ufeff", "")
+    clean = clean.strip()
+    return clean
+
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename common column variants to the required model column names."""
     renamed = {}
+
     for col in df.columns:
-        clean = str(col).strip()
-        renamed[col] = COLUMN_ALIASES.get(clean, clean)
+        clean = clean_column_name(col)
+
+        # 先用别名表匹配
+        if clean in COLUMN_ALIASES:
+            renamed[col] = COLUMN_ALIASES[clean]
+            continue
+
+        # 再做一些兜底处理
+        fallback = clean
+
+        # 常见温度乱码兜底
+        if fallback.startswith("Temperature") and "C" in fallback:
+            fallback = "Temperature(°C)"
+
+        renamed[col] = COLUMN_ALIASES.get(fallback, fallback)
+
     return df.rename(columns=renamed)
+
+
+def read_csv_safely(path_or_buffer) -> pd.DataFrame:
+    """Read CSV with several encodings to avoid UTF-8 BOM / symbol problems."""
+    encodings = ["utf-8-sig", "utf-8", "latin1"]
+
+    last_error = None
+    for enc in encodings:
+        try:
+            return pd.read_csv(path_or_buffer, encoding=enc)
+        except Exception as exc:
+            last_error = exc
+            try:
+                if hasattr(path_or_buffer, "seek"):
+                    path_or_buffer.seek(0)
+            except Exception:
+                pass
+
+    raise last_error
+
+
+def validate_columns(df: pd.DataFrame, need_target: bool = True) -> None:
+    """Check required columns. If missing, show useful error information."""
+    required = FEATURES + ([TARGET] if need_target else [])
+    missing = [col for col in required if col not in df.columns]
+
+    if missing:
+        st.error(f"Missing required columns: {missing}")
+        st.write("Available columns in your CSV:")
+        st.write(list(df.columns))
+        st.stop()
 
 
 @st.cache_data
 def load_dataset() -> pd.DataFrame:
     if not DATA_PATH.exists():
         raise FileNotFoundError(f"Dataset not found: {DATA_PATH}")
-    df = pd.read_csv(DATA_PATH)
-    return normalize_columns(df)
+
+    df = read_csv_safely(DATA_PATH)
+    df = normalize_columns(df)
+    validate_columns(df, need_target=True)
+    return df
 
 
 def train_final_model(df: pd.DataFrame) -> GradientBoostingRegressor:
@@ -244,7 +333,7 @@ def load_model_and_metadata(model_mtime: float | None, data_mtime: float | None)
             metadata = bundle if isinstance(bundle, dict) else {}
             return model, metadata, df, "loaded"
         except Exception:
-            # Fall back to training from CSV so the app still runs on Streamlit Cloud.
+            # If the saved model cannot be loaded, train from CSV.
             pass
 
     model = train_final_model(df)
@@ -279,13 +368,20 @@ def make_prediction_frame(c0: float, time_min: float, ph: float, dosage: float, 
 
 def predict_df(model, input_df: pd.DataFrame) -> np.ndarray:
     input_df = normalize_columns(input_df.copy())
+
     missing = [col for col in FEATURES if col not in input_df.columns]
     if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+        raise ValueError(
+            f"Missing required columns: {missing}. "
+            f"Available columns: {list(input_df.columns)}"
+        )
+
     X = input_df[FEATURES].apply(pd.to_numeric, errors="coerce")
+
     if X.isna().any().any():
         bad_cols = list(X.columns[X.isna().any()])
         raise ValueError(f"Non-numeric or missing values found in: {bad_cols}")
+
     return model.predict(X.to_numpy(dtype=float))
 
 
@@ -304,8 +400,10 @@ def calculate_removal_rate(qe_values, c0_values, dosage_values) -> np.ndarray:
     qe_arr = np.asarray(qe_values, dtype=float)
     c0_arr = np.asarray(c0_values, dtype=float)
     dosage_arr = np.asarray(dosage_values, dtype=float)
+
     with np.errstate(divide="ignore", invalid="ignore"):
         removal = qe_arr * dosage_arr / c0_arr * 100.0
+
     removal = np.where(np.isfinite(removal), removal, 0.0)
     return np.clip(removal, 0.0, 100.0)
 
@@ -318,6 +416,9 @@ try:
 except Exception as exc:
     st.error(f"Failed to load model/data: {exc}")
     st.stop()
+
+df_train = normalize_columns(df_train)
+validate_columns(df_train, need_target=True)
 
 ranges = df_train[FEATURES].agg(["min", "median", "max"])
 metrics = metadata.get("metrics", {}) if isinstance(metadata, dict) else {}
@@ -348,7 +449,7 @@ text = {
         "removal_label": "Removal rate",
         "qe_label": "Adsorption capacity qₑ",
         "export_button": "📁 Export prediction CSV",
-        "batch_help": "Upload a CSV containing Time(min), Temperature(°C), pH, C₀(mg/L), and Dosage(g/L). Common variants such as C0(mg/L) are also accepted.",
+        "batch_help": "Upload a CSV containing Time(min), Temperature(°C), pH, C0(mg/L), and Dosage(g/L). Temperature(C) or Temperature(??C) are also accepted.",
         "download_template": "⬇️ Download CSV template",
         "download_batch": "📁 Export batch predictions",
         "metrics_title": "Model information",
@@ -376,7 +477,7 @@ text = {
         "removal_label": "去除率",
         "qe_label": "平衡吸附量 qₑ",
         "export_button": "📁 导出预测 CSV",
-        "batch_help": "上传包含 Time(min)、Temperature(°C)、pH、C₀(mg/L)、Dosage(g/L) 的 CSV；C0(mg/L) 等常见列名也可识别。",
+        "batch_help": "上传包含 Time(min)、Temperature(°C)、pH、C0(mg/L)、Dosage(g/L) 的 CSV。Temperature(C) 或 Temperature(??C) 也可以识别。",
         "download_template": "⬇️ 下载 CSV 模板",
         "download_batch": "📁 导出批量预测结果",
         "metrics_title": "模型信息",
@@ -405,7 +506,9 @@ st.markdown(
 # -------------------------
 # 7) Main tabs
 # -------------------------
-tab_single, tab_batch, tab_info = st.tabs([text["single_tab"], text["batch_tab"], text["metrics_title"]])
+tab_single, tab_batch, tab_info = st.tabs(
+    [text["single_tab"], text["batch_tab"], text["metrics_title"]]
+)
 
 with tab_single:
     st.markdown(
@@ -418,6 +521,7 @@ with tab_single:
     )
 
     col_a, col_b = st.columns(2)
+
     with col_a:
         c0 = st.number_input(
             text["labels"]["c0"],
@@ -425,6 +529,7 @@ with tab_single:
             value=float(ranges.loc["median", "C0(mg/L)"]),
             step=1.0,
         )
+
         ph = st.number_input(
             text["labels"]["ph"],
             min_value=0.0,
@@ -432,12 +537,14 @@ with tab_single:
             value=float(ranges.loc["median", "pH"]),
             step=0.1,
         )
+
         temp = st.number_input(
             text["labels"]["temp"],
             min_value=0.0,
             value=float(ranges.loc["median", "Temperature(°C)"]),
             step=1.0,
         )
+
     with col_b:
         time_min = st.number_input(
             text["labels"]["time"],
@@ -445,6 +552,7 @@ with tab_single:
             value=float(ranges.loc["median", "Time(min)"]),
             step=10.0,
         )
+
         dosage = st.number_input(
             text["labels"]["dosage"],
             min_value=0.0,
@@ -457,6 +565,7 @@ with tab_single:
     if st.button(text["predict_button"]):
         pred_qe = float(predict_df(model, single_input)[0])
         pred_removal = float(calculate_removal_rate([pred_qe], [c0], [dosage])[0])
+
         st.markdown(
             f"""
 <div class="result-card">
@@ -471,6 +580,7 @@ with tab_single:
         result_df = single_input.copy()
         result_df["Predicted Removal Rate (%)"] = round(pred_removal, 4)
         result_df["Predicted qe(mg/g)"] = round(pred_qe, 4)
+
         st.download_button(
             text["export_button"],
             data=csv_download_bytes(result_df),
@@ -478,7 +588,10 @@ with tab_single:
             mime="text/csv",
         )
 
-    st.markdown(f"<div class='warning-card'>⚠️ {text['note']}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='warning-card'>⚠️ {text['note']}</div>",
+        unsafe_allow_html=True,
+    )
 
 with tab_batch:
     st.markdown(
@@ -489,6 +602,7 @@ with tab_batch:
 """,
         unsafe_allow_html=True,
     )
+
     st.write(text["batch_help"])
 
     template_df = pd.DataFrame(
@@ -500,6 +614,7 @@ with tab_batch:
             "Dosage(g/L)": float(ranges.loc["median", "Dosage(g/L)"]),
         }]
     )
+
     st.download_button(
         text["download_template"],
         data=csv_download_bytes(template_df),
@@ -508,35 +623,45 @@ with tab_batch:
     )
 
     uploaded_file = st.file_uploader("CSV", type=["csv"])
+
     if uploaded_file is not None:
         try:
-            batch_df = pd.read_csv(uploaded_file)
+            batch_df = read_csv_safely(uploaded_file)
+            batch_df = normalize_columns(batch_df)
+
             preds = predict_df(model, batch_df)
             output_df = normalize_columns(batch_df.copy())
+
             removal_rates = calculate_removal_rate(
                 preds,
                 output_df["C0(mg/L)"].to_numpy(dtype=float),
                 output_df["Dosage(g/L)"].to_numpy(dtype=float),
             )
+
             output_df["Predicted Removal Rate (%)"] = np.round(removal_rates, 4)
             output_df["Predicted qe(mg/g)"] = np.round(preds, 4)
+
             st.dataframe(output_df, use_container_width=True, hide_index=True)
+
             st.download_button(
                 text["download_batch"],
                 data=csv_download_bytes(output_df),
                 file_name="cip_gbr_batch_predictions.csv",
                 mime="text/csv",
             )
+
         except Exception as exc:
             st.error(str(exc))
 
 with tab_info:
     metric_cols = st.columns(3)
+
     values = [
         ("R² test", metrics.get("R2_test", 0.9831)),
         ("RMSE test", metrics.get("RMSE_test", 4.4224)),
         ("MAE test", metrics.get("MAE_test", 3.1356)),
     ]
+
     for col, (name, value) in zip(metric_cols, values):
         with col:
             st.markdown(
@@ -551,7 +676,15 @@ with tab_info:
 
     st.markdown("---")
     st.subheader(text["range_title"])
-    display_ranges = ranges.T.rename(columns={"min": "Min", "median": "Median", "max": "Max"})
+
+    display_ranges = ranges.T.rename(
+        columns={
+            "min": "Min",
+            "median": "Median",
+            "max": "Max",
+        }
+    )
+
     st.dataframe(display_ranges, use_container_width=True)
 
     st.markdown("---")
@@ -563,5 +696,7 @@ with tab_info:
         st.write("Model type:", type(model).__name__)
         st.write("Feature order:", FEATURES)
         st.write("Training rows:", len(df_train))
+        st.write("Training CSV columns:", list(df_train.columns))
+
         if METADATA_PATH.exists():
             st.write("Metadata file:", str(METADATA_PATH.name))
